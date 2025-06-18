@@ -1,0 +1,230 @@
+
+  l,q:
+    Type: "http"
+    Description: "获取窗口信息到剪切板"
+    Http:
+      proxy: ""
+      url: "http://127.0.0.1:43992/invoke"
+      method: "POST"
+      body:
+        run_python_script: |
+          import time
+          import sys
+          import ctypes
+          from ctypes import wintypes, windll
+          import psutil
+          import pyperclip
+          from datetime import datetime
+
+          # Windows API 常量
+          GWL_STYLE = -16
+          GWL_EXSTYLE = -20
+          GA_ROOT = 2
+
+          # Windows API 结构体
+          class POINT(ctypes.Structure):
+              _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+          class RECT(ctypes.Structure):
+              _fields_ = [
+                  ("left", ctypes.c_long),
+                  ("top", ctypes.c_long),
+                  ("right", ctypes.c_long),
+                  ("bottom", ctypes.c_long)
+              ]
+
+          def get_cursor_pos():
+              """获取鼠标位置"""
+              point = POINT()
+              if windll.user32.GetCursorPos(ctypes.byref(point)):
+                  return point.x, point.y
+              return None, None
+
+          def get_window_from_point(x, y):
+              """获取指定位置的窗口句柄，智能识别主窗口"""
+              point = POINT(x, y)
+              child_hwnd = windll.user32.WindowFromPoint(point)
+              
+              # 获取顶级窗口（根窗口）
+              root_hwnd = windll.user32.GetAncestor(child_hwnd, 2)  # GA_ROOT = 2
+              
+              # 如果根窗口有有意义的标题，直接返回
+              title_length = windll.user32.GetWindowTextLengthW(root_hwnd)
+              if title_length > 0:
+                  buffer = ctypes.create_unicode_buffer(title_length + 1)
+                  windll.user32.GetWindowTextW(root_hwnd, buffer, title_length + 1)
+                  title = buffer.value
+                  if title and title.strip() and len(title) > 1:
+                      return root_hwnd
+              
+              # 如果根窗口没有标题，尝试找有标题的子窗口
+              current_hwnd = child_hwnd
+              while current_hwnd:
+                  title_length = windll.user32.GetWindowTextLengthW(current_hwnd)
+                  if title_length > 0:
+                      buffer = ctypes.create_unicode_buffer(title_length + 1)
+                      windll.user32.GetWindowTextW(current_hwnd, buffer, title_length + 1)
+                      title = buffer.value
+                      if (title and title.strip() and len(title) > 3 and
+                          not title.startswith("Chrome_") and
+                          title not in ["Chrome Legacy Window", "Default IME"]):
+                          return current_hwnd
+                  
+                  # 向上查找父窗口
+                  parent = windll.user32.GetParent(current_hwnd)
+                  if parent == 0:
+                      break
+                  current_hwnd = parent
+              
+              return root_hwnd if root_hwnd else child_hwnd
+
+          def get_window_text(hwnd):
+              """获取窗口标题"""
+              length = windll.user32.GetWindowTextLengthW(hwnd)
+              if length == 0:
+                  return "<无标题>"
+              
+              buffer = ctypes.create_unicode_buffer(length + 1)
+              windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
+              return buffer.value
+
+          def get_class_name(hwnd):
+              """获取窗口类名"""
+              buffer = ctypes.create_unicode_buffer(256)
+              length = windll.user32.GetClassNameW(hwnd, buffer, 256)
+              return buffer.value if length > 0 else "<未知类名>"
+
+          def get_window_rect(hwnd):
+              """获取窗口位置和大小"""
+              rect = RECT()
+              if windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                  return {
+                      'left': rect.left,
+                      'top': rect.top,
+                      'right': rect.right,
+                      'bottom': rect.bottom,
+                      'width': rect.right - rect.left,
+                      'height': rect.bottom - rect.top
+                  }
+              return None
+
+          def get_process_info(hwnd):
+              """获取窗口所属进程信息"""
+              process_id = wintypes.DWORD()
+              thread_id = windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+              
+              try:
+                  process = psutil.Process(process_id.value)
+                  return {
+                      'pid': process_id.value,
+                      'tid': thread_id,
+                      'name': process.name(),
+                      'exe': process.exe() if process.exe() else "<无法获取路径>",
+                      'cmdline': ' '.join(process.cmdline()) if process.cmdline() else "<无命令行>"
+                  }
+              except (psutil.NoSuchProcess, psutil.AccessDenied):
+                  return {
+                      'pid': process_id.value,
+                      'tid': thread_id,
+                      'name': "<未知进程>",
+                      'exe': "<无法获取路径>",
+                      'cmdline': "<无法获取>"
+                  }
+
+          def get_window_style(hwnd):
+              """获取窗口样式"""
+              style = windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+              ex_style = windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+              return style, ex_style
+
+          def get_parent_window(hwnd):
+              """获取父窗口句柄"""
+              return windll.user32.GetParent(hwnd)
+
+          def is_window_visible(hwnd):
+              """检查窗口是否可见"""
+              return bool(windll.user32.IsWindowVisible(hwnd))
+
+          def format_window_info(hwnd, mouse_x, mouse_y):
+              """格式化窗口信息"""
+              # 获取各种信息
+              title = get_window_text(hwnd)
+              class_name = get_class_name(hwnd)
+              rect = get_window_rect(hwnd)
+              process_info = get_process_info(hwnd)
+              style, ex_style = get_window_style(hwnd)
+              parent = get_parent_window(hwnd)
+              is_visible = is_window_visible(hwnd)
+              
+              # 格式化信息 - 只保留核心信息
+              info = "=== 窗口信息 ===\n"
+              info += f"窗口句柄: {hwnd}\n"
+              info += f"窗口标题: {title}\n"
+              info += f"窗口类名: {class_name}\n\n"
+              
+              info += "=== 进程信息 ===\n"
+              info += f"进程ID: {process_info['pid']}\n"
+              info += f"进程名称: {process_info['name']}\n"
+              info += f"进程路径: {process_info['exe']}\n"
+              info += f"命令行: {process_info['cmdline']}\n"
+              info += f"线程ID: {process_info['tid']}\n\n"
+              
+              # 添加config.yaml格式
+              info += "=== Config.yaml 格式 ===\n"
+              info += "space:\n"
+              info +=  "  Type: \"window\"\n"
+              info += f'  Description: "{title}"\n'
+              info += f'  WindowTitle: "{title}"\n'
+              info += f'  WindowClass: "{class_name}"\n'
+              info += f'  WindowProcess: |-\n'
+              info += f'    {process_info["exe"]}'
+              
+              return info
+
+          def main():
+              """主函数"""
+              print("窗口信息获取工具 (Python版)")
+              print("=" * 50)
+              print("请将鼠标移动到目标窗口上...")
+              
+              # 倒计时
+              for i in range(3, 0, -1):
+                  print(f"{i}...")
+                  time.sleep(1)
+              
+              print("正在获取窗口信息...")
+              
+              try:
+                  # 获取鼠标位置
+                  mouse_x, mouse_y = get_cursor_pos()
+                  if mouse_x is None:
+                      print("❌ 无法获取鼠标位置")
+                      return
+                  
+                  # 获取窗口句柄
+                  hwnd = get_window_from_point(mouse_x, mouse_y)
+                  if hwnd == 0:
+                      print("❌ 未找到鼠标下的窗口")
+                      return
+                  
+                  # 格式化信息
+                  info = format_window_info(hwnd, mouse_x, mouse_y)
+                  
+                  # 显示信息
+                  print("\n✅ 获取到的窗口信息：")
+                  print("-" * 50)
+                  print(info)
+                  print("-" * 50)
+                  
+                  # 复制到剪贴板
+                  try:
+                      pyperclip.copy(info)
+                      print("✅ 信息已成功复制到剪贴板！")
+                  except Exception as e:
+                      print(f"❌ 复制到剪贴板失败: {e}")
+                      
+              except Exception as e:
+                  print(f"❌ 发生错误: {e}")
+
+          if __name__ == "__main__":
+              main() 
